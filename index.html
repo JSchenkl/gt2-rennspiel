@@ -250,6 +250,11 @@
                 <input type="checkbox" id="ideal-line-mode" style="margin-right:6px;cursor:pointer;">
                 Ideallinie
             </label>
+            &nbsp;&nbsp;
+            <label style="color:#ccc;font-size:15px;cursor:pointer;">
+                <input type="checkbox" id="ai-mode" style="margin-right:6px;cursor:pointer;" checked>
+                KI-Gegner
+            </label>
         </div>
         <div class="menu-buttons">
             <button class="menu-btn race" id="btn-race">Rennen starten</button>
@@ -327,6 +332,7 @@ let currentMode = 'menu'; // 'menu', 'viewer', 'editor', 'race'
 let rainMode = false;
 let nightMode = false;
 let idealLineMode = false;
+let aiMode = true;
 let soundEnabled = false;
 const rainDrops = [];
 let selectedTrackId = 'track8';
@@ -366,7 +372,7 @@ let gpConfirmPrev = false; // edge detection for confirm button
 let gpDpadPrev = { up: false, down: false, left: false, right: false };
 
 // Menu gamepad navigation
-const MENU_ITEMS = ['tracks', 'rain', 'night', 'idealline', 'btn-race', 'btn-view', 'btn-edit'];
+const MENU_ITEMS = ['tracks', 'rain', 'night', 'idealline', 'ai', 'btn-race', 'btn-view', 'btn-edit'];
 let menuCursorRow = 0; // index into MENU_ITEMS
 let menuShowCursor = false;
 
@@ -1277,6 +1283,7 @@ document.getElementById('btn-race').addEventListener('click', () => {
     rainMode = document.getElementById('rain-mode').checked;
     nightMode = document.getElementById('night-mode').checked;
     idealLineMode = document.getElementById('ideal-line-mode').checked;
+    aiMode = document.getElementById('ai-mode').checked;
     soundEnabled = false;
     rainDrops.length = 0;
     const data = getTrackData(selectedTrackId);
@@ -1284,6 +1291,7 @@ document.getElementById('btn-race').addEventListener('click', () => {
     activeTrack = data;
     activeDecorations = generateDecorations(data.points, data.normals);
     initCar(data);
+    initAICars(data);
     cam.zoom = 1.8;
     cam.angle = 0;
     camAngleSmooth = 0;
@@ -1706,6 +1714,10 @@ const GEAR_COUNT = 6;
 const tireMarks = [];            // {x, y, alpha}
 const MAX_TIRE_MARKS = 2000;
 
+// Rim sparks (world-space particles when tires are destroyed)
+const rimSparks = [];
+const MAX_RIM_SPARKS = 150;
+
 // ---- Lap Timer ----
 const lapTimer = {
     running: false,
@@ -1744,6 +1756,268 @@ function initCar(trackData) {
     lapTimer.bestTime = Infinity;
     lapTimer.lastTime = 0;
     lapTimer.crossedAway = false;
+}
+
+// ==============================================================
+//  AI CARS
+// ==============================================================
+
+const AI_COUNT = 5;
+const AI_COLORS = [
+    { body: '#cc2222', roof: '#991111' },  // rot
+    { body: '#2255cc', roof: '#113399' },  // blau
+    { body: '#22aa22', roof: '#117711' },  // gruen
+    { body: '#cc8800', roof: '#996600' },  // orange
+    { body: '#9922cc', roof: '#661199' },  // lila
+];
+let aiCars = [];
+
+function initAICars(trackData) {
+    aiCars = [];
+    if (!aiMode) return;
+    const pts = trackData.points;
+    const n = pts.length;
+    const curvature = trackData.curvature;
+
+    // Precompute ideal racing line offsets for AI
+    const offsets = new Float32Array(n);
+    const maxOff = TRACK_WIDTH * 0.55;
+    if (curvature) {
+        for (let i = 0; i < n; i++) {
+            const r = curvature[i].radius;
+            const sign = curvature[i].sign;
+            const t = Math.max(0, 1 - r / 600);
+            offsets[i] = -sign * t * maxOff;
+        }
+        for (let pass = 0; pass < 15; pass++) {
+            for (let i = 0; i < n; i++) {
+                const prev = offsets[(i - 1 + n) % n];
+                const next = offsets[(i + 1) % n];
+                offsets[i] = offsets[i] * 0.5 + (prev + next) * 0.25;
+            }
+        }
+    }
+
+    for (let i = 0; i < AI_COUNT; i++) {
+        // Stagger starting positions behind the player
+        const startIdx = Math.floor((n - (i + 1) * Math.floor(n / (AI_COUNT + 2)))) % n;
+        const p = pts[startIdx];
+        const nr = trackData.normals[startIdx];
+        const nextIdx = (startIdx + 1) % n;
+        const angle = Math.atan2(pts[nextIdx].y - p.y, pts[nextIdx].x - p.x);
+
+        // Each AI has a slightly different skill level
+        const skill = 0.7 + Math.random() * 0.25; // 0.7 - 0.95
+        const laneOffset = (Math.random() - 0.5) * 20; // slight lateral variation
+
+        aiCars.push({
+            x: p.x + nr.x * (offsets[startIdx] + laneOffset),
+            y: p.y + nr.y * (offsets[startIdx] + laneOffset),
+            vx: 0, vy: 0,
+            angle: angle,
+            speed: 0,
+            trackIdx: startIdx,
+            skill: skill,
+            maxSpeed: CAR_MAX_SPEED * (0.65 + skill * 0.3),
+            color: AI_COLORS[i % AI_COLORS.length],
+            laneOffset: laneOffset,
+            width: 28, length: 48,
+            offsets: offsets,
+        });
+    }
+}
+
+function updateAICars(dt, trackPts, normals, curvature) {
+    if (!aiMode || !trackPts) return;
+    const n = trackPts.length;
+
+    for (const ai of aiCars) {
+        // Find next target point on track (look ahead)
+        const lookAhead = Math.floor(8 + ai.speed * 0.02);
+        let bestIdx = ai.trackIdx;
+        let bestDist = Infinity;
+
+        // Search forward for closest track point
+        for (let s = 0; s < 60; s++) {
+            const idx = (ai.trackIdx + s) % n;
+            const p = trackPts[idx];
+            const dx = p.x + normals[idx].x * (ai.offsets[idx] + ai.laneOffset) - ai.x;
+            const dy = p.y + normals[idx].y * (ai.offsets[idx] + ai.laneOffset) - ai.y;
+            const d = dx * dx + dy * dy;
+            if (d < bestDist) { bestDist = d; bestIdx = idx; }
+        }
+        ai.trackIdx = bestIdx;
+
+        // Target point ahead on racing line
+        const targetIdx = (bestIdx + lookAhead) % n;
+        const tp = trackPts[targetIdx];
+        const tn = normals[targetIdx];
+        const targetX = tp.x + tn.x * (ai.offsets[targetIdx] + ai.laneOffset);
+        const targetY = tp.y + tn.y * (ai.offsets[targetIdx] + ai.laneOffset);
+
+        // Steer toward target
+        const dx = targetX - ai.x;
+        const dy = targetY - ai.y;
+        let targetAngle = Math.atan2(dy, dx);
+        let da = targetAngle - ai.angle;
+        while (da > Math.PI) da -= Math.PI * 2;
+        while (da < -Math.PI) da += Math.PI * 2;
+        ai.angle += da * Math.min(1, 4 * dt * ai.skill);
+
+        // Speed control: slow down for curves
+        let targetSpeed = ai.maxSpeed;
+        if (curvature) {
+            // Look ahead for curves and brake early
+            let minRadius = 9999;
+            for (let s = 0; s < 40; s++) {
+                const idx = (bestIdx + s) % n;
+                minRadius = Math.min(minRadius, curvature[idx].radius);
+            }
+            // Tighter curve = slower speed
+            const curveSpeedMult = Math.min(1, minRadius / 250);
+            targetSpeed *= (0.4 + 0.6 * curveSpeedMult);
+        }
+        if (rainMode) targetSpeed *= 0.8;
+
+        // Accelerate / brake
+        if (ai.speed < targetSpeed) {
+            ai.speed += CAR_POWER * ai.skill * 0.7 * dt;
+        } else {
+            ai.speed -= CAR_BRAKE_FORCE * 0.5 * dt;
+        }
+        ai.speed = Math.max(0, Math.min(ai.maxSpeed, ai.speed));
+
+        // Apply velocity
+        ai.vx = Math.cos(ai.angle) * ai.speed;
+        ai.vy = Math.sin(ai.angle) * ai.speed;
+        ai.x += ai.vx * dt;
+        ai.y += ai.vy * dt;
+
+        // Simple collision avoidance with player
+        const pdx = ai.x - car.x;
+        const pdy = ai.y - car.y;
+        const pDist = Math.sqrt(pdx * pdx + pdy * pdy);
+        if (pDist < 50 && pDist > 0) {
+            const push = (50 - pDist) * 0.3;
+            const nx = pdx / pDist, ny = pdy / pDist;
+            ai.x += nx * push * dt * 10;
+            ai.y += ny * push * dt * 10;
+            // Also push player slightly
+            car.vx -= nx * push * 2;
+            car.vy -= ny * push * 2;
+        }
+
+        // AI-to-AI collision avoidance
+        for (const other of aiCars) {
+            if (other === ai) continue;
+            const odx = ai.x - other.x;
+            const ody = ai.y - other.y;
+            const oDist = Math.sqrt(odx * odx + ody * ody);
+            if (oDist < 45 && oDist > 0) {
+                const push = (45 - oDist) * 0.15;
+                ai.x += (odx / oDist) * push;
+                ai.y += (ody / oDist) * push;
+            }
+        }
+    }
+}
+
+function drawAICar(ai) {
+    ctx.save();
+    ctx.translate(ai.x, ai.y);
+    ctx.rotate(ai.angle);
+
+    const halfL = ai.length / 2;
+    const halfW = ai.width / 2;
+
+    // Shadow
+    ctx.save();
+    ctx.translate(2, 2);
+    ctx.beginPath();
+    drawCarBody(halfL, halfW);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fill();
+    ctx.restore();
+
+    // Body
+    ctx.beginPath();
+    drawCarBody(halfL, halfW);
+    ctx.fillStyle = ai.color.body;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Roof
+    ctx.beginPath();
+    ctx.ellipse(0, 0, halfL * 0.35, halfW * 0.6, 0, 0, Math.PI * 2);
+    ctx.fillStyle = ai.color.roof;
+    ctx.fill();
+
+    // Windshield
+    ctx.beginPath();
+    ctx.ellipse(halfL * 0.15, 0, halfL * 0.15, halfW * 0.55, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(100,140,180,0.5)';
+    ctx.fill();
+
+    // Wheels
+    for (const wp of [
+        { x: halfL * 0.55, y: halfW + 0.5 },
+        { x: halfL * 0.55, y: -(halfW + 0.5) },
+        { x: -halfL * 0.5, y: halfW + 0.5 },
+        { x: -halfL * 0.5, y: -(halfW + 0.5) },
+    ]) {
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(wp.x - 3.5, wp.y - 1.8, 7, 3.6);
+        ctx.fillStyle = '#333';
+        ctx.fillRect(wp.x - 2.5, wp.y - 1.5, 5, 3);
+    }
+
+    // Rear lights
+    for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(200, 30, 30, 0.6)';
+        ctx.fillRect(-halfL, side * (halfW - 3), 2, side * 2.5);
+    }
+
+    ctx.restore();
+}
+
+function drawAICars() {
+    if (!aiMode) return;
+    for (const ai of aiCars) {
+        drawAICar(ai);
+    }
+}
+
+function drawAICarsOnMinimap() {
+    if (!aiMode || !activeTrack) return;
+    const trackPts = activeTrack.points;
+    const mmW = 180, mmH = 130;
+    const mmX = canvas.width - mmW - 16, mmY = canvas.height - mmH - 16;
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of trackPts) {
+        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+    }
+    const scaleX = (mmW - 20) / (maxX - minX + 120);
+    const scaleY = (mmH - 20) / (maxY - minY + 120);
+    const sc = Math.min(scaleX, scaleY);
+    const cx = mmX + mmW / 2, cy = mmY + mmH / 2;
+    const tCx = (minX + maxX) / 2, tCy = (minY + maxY) / 2;
+
+    for (const ai of aiCars) {
+        const ax = cx + (ai.x - tCx) * sc;
+        const ay = cy + (ai.y - tCy) * sc;
+        ctx.beginPath();
+        ctx.arc(ax, ay, 3, 0, Math.PI * 2);
+        ctx.fillStyle = ai.color.body;
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+    }
 }
 
 function formatLapTime(ms) {
@@ -2253,6 +2527,10 @@ function updateCar(dt, trackPts) {
     } else if (isAccel) {
         const accelMult = gpAccelAmount > 0.1 ? gpAccelAmount : 1.0;
         let power = CAR_POWER;
+        // Worn tires: less power (rubber gone, metal rims = bad traction)
+        if (car.tireWear < 10) {
+            power *= 0.4 + 0.6 * (car.tireWear / 10);
+        }
         // Above ~250 km/h: power drops off progressively (air resistance / top-end)
         if (fwd > CAR_POWER_FALLOFF_START) {
             const ratio = (fwd - CAR_POWER_FALLOFF_START) / (CAR_MAX_SPEED - CAR_POWER_FALLOFF_START);
@@ -2275,7 +2553,9 @@ function updateCar(dt, trackPts) {
     // Longitudinal drag
     const drag = onTrack ? SURFACE_DRAG : GRASS_DRAG;
     fwd *= Math.max(0, 1 - drag * dt);
-    const damageMaxSpeed = CAR_MAX_SPEED * (1 - car.damage * 0.005);
+    // Worn tires reduce top speed (driving on rims)
+    const tireSpeedMult = car.tireWear < 10 ? 0.55 + 0.45 * (car.tireWear / 10) : 1.0;
+    const damageMaxSpeed = CAR_MAX_SPEED * (1 - car.damage * 0.005) * tireSpeedMult;
     fwd = Math.max(CAR_MAX_REVERSE, Math.min(damageMaxSpeed, fwd));
 
     // ---- Steering -> yaw rotation ----
@@ -2305,8 +2585,8 @@ function updateCar(dt, trackPts) {
     // Lateral grip: tires try to kill lateral velocity, but only up to GRIP_MAX
     // When lateral speed exceeds what grip can handle -> car slides!
     let availableGrip = GRIP_MAX * gripMult;
-    // Tire wear: full grip above 20%, then drops to 30% at 0%
-    const wearGrip = car.tireWear >= 20 ? 1.0 : 0.3 + 0.7 * (car.tireWear / 20);
+    // Tire wear: full grip above 20%, then drops to 15% at 0% (metal on asphalt)
+    const wearGrip = car.tireWear >= 20 ? 1.0 : 0.15 + 0.85 * (car.tireWear / 20);
     availableGrip *= wearGrip;
     if (rainMode) availableGrip *= 0.6;  // wet track = less grip
     if (isBraking) availableGrip *= GRIP_BRAKE_MULT;
@@ -2392,7 +2672,7 @@ function updateCar(dt, trackPts) {
 
     // ---- Pit stop detection (only in slots, timed) ----
     const inSlot = isInPitSlot(car.x, car.y, trackPts, activeTrack ? activeTrack.normals : null);
-    const needsService = car.tireWear < 99 || car.damage > 5;
+    const needsService = car.tireWear <= 80 || car.damage > 5;
     if (inSlot && absSpd < 5 && needsService) {
         if (!car.pitStopActive) {
             // Duration: base 2-5s + extra for damage repair
@@ -2475,6 +2755,46 @@ function drawTireMarks() {
         ctx.beginPath();
         ctx.arc(m2.x, m2.y, 1.8, 0, Math.PI * 2);
         ctx.fill();
+    }
+}
+
+// ---- Rim sparks update & draw (world space) ----
+function updateRimSparks(dt) {
+    for (let i = rimSparks.length - 1; i >= 0; i--) {
+        const s = rimSparks[i];
+        s.x += s.vx * dt;
+        s.y += s.vy * dt;
+        s.vx *= 0.96; // friction / air drag
+        s.vy *= 0.96;
+        s.life -= dt;
+        if (s.life <= 0) {
+            rimSparks.splice(i, 1);
+        }
+    }
+}
+
+function drawRimSparks() {
+    for (const s of rimSparks) {
+        const t = s.life / s.maxLife; // 1 = fresh, 0 = dead
+        const alpha = t * 0.9;
+        // Color: bright yellow-white -> orange -> red as it fades
+        const r = 255;
+        const g = Math.round(200 * t + 80 * (1 - t));
+        const b = Math.round(150 * t * t);
+        // Spark dot
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.size * t, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+        ctx.fill();
+        // Spark trail
+        const trailX = s.x - s.vx * 0.03;
+        const trailY = s.y - s.vy * 0.03;
+        ctx.beginPath();
+        ctx.moveTo(s.x, s.y);
+        ctx.lineTo(trailX, trailY);
+        ctx.strokeStyle = `rgba(${r},${g},${b},${alpha * 0.6})`;
+        ctx.lineWidth = s.size * t * 0.6;
+        ctx.stroke();
     }
 }
 
@@ -2706,10 +3026,28 @@ function drawCar() {
             ctx.save();
             ctx.translate(wp.x, wp.y);
             if (wp.front) ctx.rotate(car.steerAngle * 4);
-            ctx.fillStyle = '#1a1a1a';
-            ctx.fillRect(-3.5, -1.8, 7, 3.6);
-            ctx.fillStyle = '#333';
-            ctx.fillRect(-2.5, -1.5, 5, 3);
+            if (car.tireWear < 10) {
+                // Metal rims - no rubber left
+                const rimMix = 1 - car.tireWear / 10;
+                const r1 = Math.round(26 + rimMix * (160 - 26));
+                const r2 = Math.round(26 + rimMix * (140 - 26));
+                const g1 = Math.round(26 + rimMix * (165 - 26));
+                const g2 = Math.round(26 + rimMix * (145 - 26));
+                const b1 = Math.round(26 + rimMix * (175 - 26));
+                const b2 = Math.round(26 + rimMix * (155 - 26));
+                ctx.fillStyle = `rgb(${r1},${g1},${b1})`;
+                ctx.fillRect(-3.5, -1.8, 7, 3.6);
+                ctx.fillStyle = `rgb(${r2},${g2},${b2})`;
+                ctx.fillRect(-2.5, -1.5, 5, 3);
+                // Metallic highlight
+                ctx.fillStyle = `rgba(220,225,230,${rimMix * 0.3})`;
+                ctx.fillRect(-1.5, -1.2, 3, 1);
+            } else {
+                ctx.fillStyle = '#1a1a1a';
+                ctx.fillRect(-3.5, -1.8, 7, 3.6);
+                ctx.fillStyle = '#333';
+                ctx.fillRect(-2.5, -1.5, 5, 3);
+            }
             ctx.restore();
         }
     }
@@ -2809,6 +3147,34 @@ function drawCar() {
             ctx.arc(fx, fy, 1 + Math.random(), 0, Math.PI * 2);
             ctx.fillStyle = `rgba(255, ${100 + Math.random() * 100}, 0, 0.7)`;
             ctx.fill();
+        }
+    }
+
+    // ---- Tire sparks: spawn world-space particles when tires are destroyed ----
+    if (car.tireWear < 10 && Math.abs(car.vx) + Math.abs(car.vy) > 30) {
+        const sparkIntensity = 1 - car.tireWear / 10;
+        const sparkCount = Math.ceil(sparkIntensity * 4);
+        const cosA = Math.cos(car.angle), sinA = Math.sin(car.angle);
+        for (let i = 0; i < sparkCount; i++) {
+            if (Math.random() > 0.3) {
+                // Spawn from rear wheels in world space
+                const localX = -halfL * 0.5;
+                const localY = (Math.random() > 0.5 ? 1 : -1) * (halfW + 0.5);
+                const wx = car.x + cosA * localX - sinA * localY;
+                const wy = car.y + sinA * localX + cosA * localY;
+                // Velocity: mostly backward + random scatter
+                const speed = 40 + Math.random() * 120;
+                const scatter = (Math.random() - 0.5) * 80;
+                rimSparks.push({
+                    x: wx, y: wy,
+                    vx: -cosA * speed + sinA * scatter + car.vx * 0.3,
+                    vy: -sinA * speed - cosA * scatter + car.vy * 0.3,
+                    life: 0.3 + Math.random() * 0.5,
+                    maxLife: 0.3 + Math.random() * 0.5,
+                    size: 0.5 + Math.random() * 1.5
+                });
+                while (rimSparks.length > MAX_RIM_SPARKS) rimSparks.shift();
+            }
         }
     }
 
@@ -2947,6 +3313,12 @@ function drawRace() {
     // Draw tire marks
     drawTireMarks();
 
+    // Draw rim sparks (behind car, in world space)
+    drawRimSparks();
+
+    // Draw AI cars
+    drawAICars();
+
     // Draw car
     drawCar();
 
@@ -3038,6 +3410,7 @@ function drawRace() {
 
     // HUD overlays (not rotated)
     drawMinimap(activeTrack.points);
+    drawAICarsOnMinimap();
     drawCarOnMinimap();
 }
 
@@ -3120,6 +3493,9 @@ function update(time) {
             } else if (item === 'idealline' && gpState.confirm) {
                 const cb = document.getElementById('ideal-line-mode');
                 cb.checked = !cb.checked;
+            } else if (item === 'ai' && gpState.confirm) {
+                const cb = document.getElementById('ai-mode');
+                cb.checked = !cb.checked;
             } else if (item === 'btn-race' && gpState.confirm) {
                 document.getElementById('btn-race').click();
             } else if (item === 'btn-view' && gpState.confirm) {
@@ -3153,6 +3529,8 @@ function update(time) {
         if (keys['-']) cam.zoom /= 1.02;
         cam.zoom = Math.max(0.5, Math.min(4, cam.zoom));
         updateCar(dt, activeTrack.points);
+        updateAICars(dt, activeTrack.points, activeTrack.normals, activeTrack.curvature);
+        updateRimSparks(dt);
         drawRace();
     } else {
         // Viewer / Editor: WASD + arrows control camera
