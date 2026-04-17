@@ -1,0 +1,12 @@
+{
+  "name": "gt2-multiplayer",
+  "version": "1.0.0",
+  "description": "GT2 Rennspiel Multiplayer Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

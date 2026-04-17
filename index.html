@@ -251,6 +251,12 @@
                 Ideallinie
             </label>
         </div>
+        <div style="margin-bottom:16px;display:flex;align-items:center;gap:10px;justify-content:center;">
+            <label style="font-size:14px;color:#aaa;">Name:</label>
+            <input id="player-name" type="text" maxlength="16" value="Fahrer1"
+                style="background:#1a1a3e;border:1px solid #444;color:#fff;padding:6px 12px;border-radius:6px;font-size:14px;width:140px;outline:none;">
+            <span id="mp-status" style="font-size:12px;color:#666;">&#9679; Offline</span>
+        </div>
         <div class="menu-buttons">
             <button class="menu-btn race" id="btn-race">Rennen starten</button>
             <button class="menu-btn view" id="btn-view">Strecke anschauen</button>
@@ -3292,6 +3298,9 @@ function drawRace() {
     // Draw rim sparks (behind car, in world space)
     drawRimSparks();
 
+    // Draw remote players (behind local car)
+    drawRemotePlayers();
+
     // Draw car
     drawCar();
 
@@ -3514,6 +3523,7 @@ function update(time) {
         if (keys['-']) cam.zoom /= 1.02;
         cam.zoom = Math.max(0.5, Math.min(4, cam.zoom));
         updateCar(dt, activeTrack.points);
+        mpSendState();
         updateRimSparks(dt);
         drawRace();
     } else {
@@ -3546,6 +3556,142 @@ function update(time) {
 // ---- Init ----
 buildMenu();
 requestAnimationFrame(update);
+
+// =====================================================================
+//  MULTIPLAYER
+// =====================================================================
+const remotePlayers = new Map(); // id -> { x, y, angle, name, color, tireWear, damage, lapCount }
+let mpSocket = null;
+let mpId = null;
+let mpColor = '#e74c3c';
+let mpConnected = false;
+const MP_SEND_INTERVAL = 50; // ms
+let mpLastSend = 0;
+
+function mpConnect() {
+    const wsUrl = `ws://${location.hostname}:3000`;
+    try {
+        mpSocket = new WebSocket(wsUrl);
+    } catch(e) { return; }
+
+    mpSocket.onopen = () => {
+        mpConnected = true;
+        document.getElementById('mp-status').textContent = '● Online';
+        document.getElementById('mp-status').style.color = '#2ecc71';
+    };
+
+    mpSocket.onclose = () => {
+        mpConnected = false;
+        remotePlayers.clear();
+        document.getElementById('mp-status').textContent = '● Offline';
+        document.getElementById('mp-status').style.color = '#666';
+        // Reconnect after 3 seconds
+        setTimeout(mpConnect, 3000);
+    };
+
+    mpSocket.onerror = () => {};
+
+    mpSocket.onmessage = (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+
+        if (msg.type === 'welcome') {
+            mpId = msg.id;
+            mpColor = msg.color;
+            // Add all existing players
+            for (const p of msg.players) {
+                remotePlayers.set(p.id, p);
+            }
+        } else if (msg.type === 'state') {
+            if (msg.id === mpId) return;
+            const existing = remotePlayers.get(msg.id) || {};
+            remotePlayers.set(msg.id, { ...existing, ...msg });
+        } else if (msg.type === 'leave') {
+            remotePlayers.delete(msg.id);
+        }
+    };
+}
+
+function mpSendState() {
+    if (!mpConnected || !mpSocket || mpSocket.readyState !== 1) return;
+    const now = performance.now();
+    if (now - mpLastSend < MP_SEND_INTERVAL) return;
+    mpLastSend = now;
+    const name = document.getElementById('player-name')?.value || 'Fahrer';
+    mpSocket.send(JSON.stringify({
+        type: 'state',
+        name,
+        x: car.x,
+        y: car.y,
+        angle: car.angle,
+        vx: car.vx,
+        vy: car.vy,
+        tireWear: car.tireWear,
+        damage: car.damage,
+        pitStopActive: car.pitStopActive,
+    }));
+}
+
+function drawRemoteCar(p) {
+    if (p.x == null || p.y == null) return;
+    const halfL = 25, halfW = 15;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.angle || 0);
+
+    // Shadow
+    ctx.save();
+    ctx.translate(2, 2);
+    ctx.beginPath();
+    drawCarBody(halfL, halfW);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fill();
+    ctx.restore();
+
+    // Body in player color
+    ctx.beginPath();
+    drawCarBody(halfL, halfW);
+    ctx.fillStyle = p.color || '#e74c3c';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Windshield
+    ctx.beginPath();
+    ctx.moveTo(halfL * 0.18, -halfW + 3);
+    ctx.lineTo(halfL * 0.05, -halfW + 2.5);
+    ctx.lineTo(halfL * 0.05, halfW - 2.5);
+    ctx.lineTo(halfL * 0.18, halfW - 3);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fill();
+
+    // Name label above car
+    ctx.rotate(-( p.angle || 0));
+    ctx.rotate(0); // reset rotation for text
+    ctx.restore();
+
+    // Draw name in screen space via world coords (stays in ctx.save block)
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = p.color || '#e74c3c';
+    ctx.fillText(p.name || '?', 0, -20);
+    ctx.restore();
+}
+
+function drawRemotePlayers() {
+    for (const [, p] of remotePlayers) {
+        drawRemoteCar(p);
+    }
+}
+
+// Start connecting immediately
+mpConnect();
 
 </script>
 </body>
