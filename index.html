@@ -1013,11 +1013,35 @@ function drawEdgeLines(pts, normals, curv, halfWidth) {
     }
 }
 
+function getGridPositions(pts, normals) {
+    const p = pts[0], n = normals[0];
+    // Track forward direction
+    const next = pts[1], prev = pts[pts.length - 1];
+    const fdx = next.x - prev.x, fdy = next.y - prev.y;
+    const flen = Math.sqrt(fdx * fdx + fdy * fdy) || 1;
+    // Backward direction (before start line)
+    const bx = -fdx / flen, by = -fdy / flen;
+    const ROW_SPACING = 55;
+    const SIDE_OFFSET = TRACK_WIDTH * 0.32;
+    const positions = [];
+    for (let i = 0; i < 6; i++) {
+        const row = Math.floor(i / 2);
+        const side = i % 2 === 0 ? -1 : 1; // P1 left, P2 right, ...
+        const dist = ROW_SPACING * (row + 1);
+        positions.push({
+            x: p.x + bx * dist + n.x * side * SIDE_OFFSET,
+            y: p.y + by * dist + n.y * side * SIDE_OFFSET,
+            angle: Math.atan2(fdy, fdx),
+            num: i + 1,
+        });
+    }
+    return positions;
+}
+
 function drawStartFinish(pts, normals) {
     const p = pts[0], n = normals[0];
     const sqSize = 8, rows = 4;
     const cols = Math.ceil(TRACK_WIDTH * 2 / sqSize);
-    // Rotate along the normal direction (perpendicular to track = across the road)
     const angle = Math.atan2(n.y, n.x);
     ctx.save();
     ctx.translate(p.x, p.y);
@@ -1036,6 +1060,28 @@ function drawStartFinish(pts, normals) {
     ctx.textAlign = 'center';
     ctx.fillText('START / ZIEL', 0, 0);
     ctx.restore();
+
+    // Draw grid boxes
+    const grid = getGridPositions(pts, normals);
+    const boxW = 28, boxH = 18;
+    for (const g of grid) {
+        ctx.save();
+        ctx.translate(g.x, g.y);
+        ctx.rotate(g.angle);
+        // Box outline
+        ctx.fillStyle = 'rgba(255,255,255,0.15)';
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1.5;
+        ctx.fillRect(-boxW / 2, -boxH / 2, boxW, boxH);
+        ctx.strokeRect(-boxW / 2, -boxH / 2, boxW, boxH);
+        // Position number
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`P${g.num}`, 0, 0);
+        ctx.restore();
+    }
 }
 
 // ---- Barriers (Banden) ----
@@ -1794,7 +1840,7 @@ const CAR_MASS = 1.0;
 const CAR_INERTIA = 0.75;
 
 // Grip: max lateral px/s the tires can kill per second
-const GRIP_MAX = 12000;           // base lateral grip (px/s²) - high = stable
+const GRIP_MAX = 11000;           // base lateral grip (px/s²) - high = stable
 const GRIP_BRAKE_MULT = 0.9;     // grip when braking in corner
 const GRIP_ACCEL_MULT = 0.7;     // grip when accelerating in corner
 const DRIFT_THRESHOLD = 120;     // lateral speed (px/s) to count as drifting
@@ -1831,11 +1877,15 @@ const lapTimer = {
 
 function initCar(trackData) {
     const pts = trackData.points;
-    car.x = pts[0].x;
-    car.y = pts[0].y;
+    const normals = trackData.normals;
+    // Place car on P1 grid position
+    const grid = getGridPositions(pts, normals);
+    const p1 = grid[0];
+    car.x = p1.x;
+    car.y = p1.y;
+    car.angle = p1.angle;
     const next = pts[1];
     const prev = pts[pts.length - 1];
-    car.angle = Math.atan2(next.y - prev.y, next.x - prev.x);
     car.vx = 0; car.vy = 0;
     car.angularVel = 0;
     car.steerAngle = 0;
