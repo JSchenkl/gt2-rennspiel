@@ -274,6 +274,9 @@
         <div id="race-tires" style="font-size:15px;font-weight:bold;margin-top:4px;font-variant-numeric:tabular-nums;">Reifen: 100%</div>
         <div id="race-damage" style="font-size:15px;font-weight:bold;margin-top:4px;font-variant-numeric:tabular-nums;">Schaden: <span style="color:#0f0">0%</span></div>
         <div id="race-pit" style="font-size:14px;color:#0ff;font-weight:bold;margin-top:2px;"></div>
+        <div id="race-pitlimiter" style="font-size:14px;color:#ff0;font-weight:bold;margin-top:2px;display:none;">PIT LIMITER aktiv [V]</div>
+        <div id="race-warning" style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#fff;color:#111;font-size:22px;font-weight:bold;padding:14px 80px;border-radius:8px;display:none;text-align:center;letter-spacing:1px;box-shadow:0 2px 12px #0006;"></div>
+        <div id="race-penalty" style="position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:#c00;color:#fff;font-size:22px;font-weight:bold;padding:14px 80px;border-radius:8px;display:none;text-align:center;letter-spacing:1px;box-shadow:0 2px 12px #0006;"></div>
         <div id="race-drift" style="font-size:13px;color:#f84;font-weight:bold;margin-top:2px;"></div>
     </div>
 
@@ -353,6 +356,10 @@ window.addEventListener('keydown', e => {
         const idx = CAMERA_MODES.indexOf(cameraMode);
         cameraMode = CAMERA_MODES[(idx + 1) % CAMERA_MODES.length];
         updateCameraHud();
+    }
+    // V key toggles pit limiter
+    if ((e.key === 'v' || e.key === 'V') && currentMode === 'race') {
+        car.pitLimiter = !car.pitLimiter;
     }
 });
 window.addEventListener('keyup', e => { keys[e.key] = false; });
@@ -819,27 +826,6 @@ function generateDecorations(trackPts, trackNormals) {
         }
     }
 
-    // Grandstands
-    if (trackPts.length > 100) {
-        const positions = [0, Math.floor(trackPts.length * 0.12), Math.floor(trackPts.length * 0.33),
-                          Math.floor(trackPts.length * 0.58), Math.floor(trackPts.length * 0.8)];
-        for (const idx of positions) {
-            if (idx >= trackPts.length) continue;
-            const p = trackPts[idx];
-            const n = trackNormals[idx];
-            const dist = TRACK_WIDTH + GRASS_EXTEND + 80;
-            const side = rand() > 0.5 ? 1 : -1;
-            decorations.push({
-                type: 'grandstand',
-                x: p.x + n.x * dist * side,
-                y: p.y + n.y * dist * side,
-                angle: Math.atan2(n.y, n.x),
-                width: 60 + rand() * 40,
-                height: 16 + rand() * 10
-            });
-        }
-    }
-
     return decorations;
 }
 
@@ -1150,26 +1136,6 @@ function drawDecorations(decos) {
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText('50', -sw / 2 - 8, 0);
-            ctx.restore();
-        } else if (d.type === 'grandstand') {
-            ctx.save();
-            ctx.translate(d.x, d.y);
-            ctx.rotate(d.angle);
-            ctx.fillStyle = '#666';
-            ctx.fillRect(-d.width / 2, -d.height / 2, d.width, d.height);
-            const colors = ['#e03030', '#3060e0', '#e0e030', '#30e060'];
-            const seatRows = 3, seatW = d.width / colors.length;
-            for (let r = 0; r < seatRows; r++) {
-                for (let c = 0; c < colors.length; c++) {
-                    ctx.fillStyle = colors[(c + r) % colors.length];
-                    ctx.globalAlpha = 0.7;
-                    ctx.fillRect(-d.width / 2 + c * seatW + 1, -d.height / 2 + r * (d.height / seatRows) + 1,
-                        seatW - 2, d.height / seatRows - 2);
-                }
-            }
-            ctx.globalAlpha = 1;
-            ctx.fillStyle = '#444';
-            ctx.fillRect(-d.width / 2, -d.height / 2 - 4, d.width, 4);
             ctx.restore();
         }
     }
@@ -1800,6 +1766,12 @@ const car = {
     pitStopDuration: 0,  // total duration of current pit stop
     damage: 0,           // 0 = no damage, 100 = totaled
     smokeParticles: [],
+    pitLimiter: false,
+    pitPenalty: 0,       // accumulated penalty seconds
+    penaltyMsgTimer: 0,
+    penaltyMsg: '',
+    prevX: null,
+    prevY: null,
 };
 
 // Physics constants
@@ -1826,7 +1798,7 @@ const TIRE_PIT_REFILL = 50;      // refill rate per second in pit
 
 // Surface
 const SURFACE_DRAG = 0.40;
-const GRASS_DRAG = 1.0;
+const GRASS_DRAG = 2.5;
 const GRASS_GRIP_MULT = 0.4;     // reduced grip on gravel
 
 // Gears (speed thresholds in px/s for auto-shift)
@@ -1872,6 +1844,12 @@ function initCar(trackData) {
     car.pitStopDuration = 0;
     car.damage = 0;
     car.smokeParticles = [];
+    car.pitLimiter = false;
+    car.pitPenalty = 0;
+    car.penaltyMsgTimer = 0;
+    car.penaltyMsg = '';
+    car.prevX = null;
+    car.prevY = null;
     tireMarks.length = 0;
     lapTimer.running = false;
     lapTimer.startTime = 0;
@@ -2100,6 +2078,58 @@ function drawBarrier(trackPts, trackNormals) {
     }
 }
 
+function checkSegmentCrossing(lx1, ly1, lx2, ly2) {
+    if (car.prevX === null) return false;
+    const d1x = car.x - car.prevX, d1y = car.y - car.prevY;
+    const d2x = lx2 - lx1, d2y = ly2 - ly1;
+    const cross = d1x * d2y - d1y * d2x;
+    if (Math.abs(cross) < 0.0001) return false;
+    const dx = lx1 - car.prevX, dy = ly1 - car.prevY;
+    const t = (dx * d2y - dy * d2x) / cross;
+    const u = (dx * d1y - dy * d1x) / cross;
+    return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+}
+
+function applyPitSpeedPenalty() {
+    const absSpd = Math.sqrt(car.vx * car.vx + car.vy * car.vy);
+    const kmhSpeed = absSpd * (320 / 889);
+    const over = kmhSpeed - 80;
+    if (over > 2 && over <= 20) {
+        car.pitPenalty += 10;
+        car.penaltyMsg = 'You have a 10 second time penalty for that';
+        car.penaltyMsgTimer = 6;
+    } else if (over > 20) {
+        car.pitPenalty += 30;
+        car.penaltyMsg = 'You have a 30 second time penalty for that';
+        car.penaltyMsgTimer = 6;
+    }
+}
+
+function checkPitEntryLineCrossing(trackPts, trackNormals) {
+    if (car.prevX === null) return;
+    const wall = getPitWallPoints(trackPts, trackNormals);
+    if (wall.length < 2) return;
+    const lineW = PIT_HALF_W * 2;
+
+    // Entry line (wall start)
+    const w0 = wall[0], w1 = wall[1];
+    const wdx = w1.x - w0.x, wdy = w1.y - w0.y;
+    const wlen = Math.sqrt(wdx * wdx + wdy * wdy) || 1;
+    const wnx = -wdy / wlen, wny = wdx / wlen;
+    if (checkSegmentCrossing(w0.x, w0.y, w0.x + wnx * lineW, w0.y + wny * lineW)) {
+        applyPitSpeedPenalty();
+    }
+
+    // Exit line (wall end)
+    const wE0 = wall[wall.length - 1], wE1 = wall[wall.length - 2];
+    const wedx = wE0.x - wE1.x, wedy = wE0.y - wE1.y;
+    const welen = Math.sqrt(wedx * wedx + wedy * wedy) || 1;
+    const wenx = -wedy / welen, weny = wedx / welen;
+    if (checkSegmentCrossing(wE0.x, wE0.y, wE0.x + wenx * lineW, wE0.y + weny * lineW)) {
+        applyPitSpeedPenalty();
+    }
+}
+
 function checkPitWallCollision(trackPts, trackNormals) {
     const wall = getPitWallPoints(trackPts, trackNormals);
     if (wall.length < 2) return;
@@ -2151,7 +2181,7 @@ function getPitSlotPositions(trackPts, trackNormals) {
 
 function isInPitSlot(wx, wy, trackPts, trackNormals) {
     const slots = getPitSlotPositions(trackPts, trackNormals);
-    const slotRadius2 = 25 * 25;
+    const slotRadius2 = 45 * 45;
     // Sample 5 points along the car's length; trigger if >= 60% (3/5) inside slot
     const cosA = Math.cos(car.angle), sinA = Math.sin(car.angle);
     const SAMPLES = 5;
@@ -2314,6 +2344,28 @@ function drawPitLane(trackPts, trackNormals) {
     // Pit wall (between track and pit main section)
     const wall = getPitWallPoints(trackPts, trackNormals);
     if (wall.length > 1) {
+        // White entry line at pit wall start
+        const w0 = wall[0], w1 = wall[1];
+        const wdx = w1.x - w0.x, wdy = w1.y - w0.y;
+        const wlen = Math.sqrt(wdx * wdx + wdy * wdy) || 1;
+        const wnx = -wdy / wlen, wny = wdx / wlen;
+        const lineW = PIT_HALF_W * 2;
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(w0.x, w0.y);
+        ctx.lineTo(w0.x + wnx * lineW, w0.y + wny * lineW);
+        ctx.stroke();
+        // White exit line at pit wall end
+        const wE0 = wall[wall.length - 1], wE1 = wall[wall.length - 2];
+        const wedx = wE0.x - wE1.x, wedy = wE0.y - wE1.y;
+        const welen = Math.sqrt(wedx * wedx + wedy * wedy) || 1;
+        const wenx = -wedy / welen, weny = wedx / welen;
+        ctx.beginPath();
+        ctx.moveTo(wE0.x, wE0.y);
+        ctx.lineTo(wE0.x + wenx * lineW, wE0.y + weny * lineW);
+        ctx.stroke();
         ctx.beginPath();
         ctx.moveTo(wall[0].x, wall[0].y);
         for (let i = 1; i < wall.length; i++) {
@@ -2358,7 +2410,7 @@ function updateCar(dt, trackPts) {
     if (dt <= 0) return;
 
 
-    const onTrack = isOnTrack(car.x, car.y, trackPts);
+    const onTrack = isOnTrack(car.x, car.y, trackPts) || isInPitLane(car.x, car.y, trackPts);
     const gripMult = onTrack ? 1.0 : GRASS_GRIP_MULT;
     const isBraking = keys['s'] || keys['S'] || keys[' '] || gpState.brake > 0.1;
     const isAccel = keys['w'] || keys['W'] || gpState.accel > 0.1;
@@ -2434,6 +2486,16 @@ function updateCar(dt, trackPts) {
     const damageMaxSpeed = CAR_MAX_SPEED * (1 - car.damage * 0.005) * tireSpeedMult;
     fwd = Math.max(CAR_MAX_REVERSE, Math.min(damageMaxSpeed, fwd));
 
+    // ---- Pit limiter: cap fwd while still approaching 80 km/h ----
+    if (car.pitLimiter && fwd > 0) {
+        const PIT_LIMIT = 222; // 80 km/h in px/s
+        if (fwd > PIT_LIMIT) {
+            const over = fwd - PIT_LIMIT;
+            const decelRate = 1.5 + (over / CAR_MAX_SPEED) * 4.0;
+            fwd = Math.max(PIT_LIMIT, fwd - decelRate * fwd * dt);
+        }
+    }
+
     // ---- Steering -> yaw rotation ----
     // Bicycle model: car turns based on steer angle and forward speed
     if (Math.abs(fwd) > 1) {
@@ -2488,6 +2550,17 @@ function updateCar(dt, trackPts) {
     car.vx = newFwd * cosA2 - newLat * sinA2;
     car.vy = newFwd * sinA2 + newLat * cosA2;
 
+    // ---- Pit limiter: hard cap on total speed after world conversion ----
+    if (car.pitLimiter) {
+        const PIT_LIMIT = 222;
+        const totalSpd = Math.sqrt(car.vx * car.vx + car.vy * car.vy);
+        if (totalSpd > PIT_LIMIT) {
+            const s = PIT_LIMIT / totalSpd;
+            car.vx *= s;
+            car.vy *= s;
+        }
+    }
+
     // ---- Move ----
     car.x += car.vx * dt;
     car.y += car.vy * dt;
@@ -2524,7 +2597,7 @@ function updateCar(dt, trackPts) {
 
     // ---- Damage from off-track at high speed ----
     if (!onTrack && absSpd > 150) {
-        car.damage = Math.min(100, car.damage + (absSpd - 150) * 0.003 * dt);
+        car.damage = Math.min(100, car.damage + (absSpd - 150) * 0.0005 * dt);
     }
 
     // ---- Tire wear ----
@@ -2534,14 +2607,12 @@ function updateCar(dt, trackPts) {
     car.tireWear -= speedRatio * steerFactor * driftMult * TIRE_WEAR_RATE * dt;
     car.tireWear = Math.max(0, Math.min(100, car.tireWear));
 
-    // ---- Pit lane speed limit (80 km/h) ----
     const inPitLane = isInPitLane(car.x, car.y, trackPts);
-    const PIT_SPEED_LIMIT = 222; // ~80 km/h
-    if (inPitLane && absSpd > PIT_SPEED_LIMIT) {
-        const scale = PIT_SPEED_LIMIT / absSpd;
-        car.vx *= scale;
-        car.vy *= scale;
-    }
+
+    // ---- Pit entry line speed check ----
+    checkPitEntryLineCrossing(trackPts, activeTrack ? activeTrack.normals : null);
+    car.prevX = car.x;
+    car.prevY = car.y;
 
     // ---- Pit wall collision ----
     checkPitWallCollision(trackPts, activeTrack ? activeTrack.normals : null);
@@ -2549,24 +2620,23 @@ function updateCar(dt, trackPts) {
     // ---- Barrier collision ----
     if (activeTrack && activeTrack.barriers) checkBarrierCollisions(activeTrack.barriers);
 
-    // ---- Pit stop detection (only in slots, timed) ----
+    // ---- Pit stop detection (only in slots) ----
+    const worldSpd = Math.sqrt(car.vx * car.vx + car.vy * car.vy);
     const inSlot = isInPitSlot(car.x, car.y, trackPts, activeTrack ? activeTrack.normals : null);
-    const needsService = car.tireWear <= 80 || car.damage > 5;
-    if (inSlot && absSpd < 5 && needsService) {
+    const needsService = car.tireWear < 100 || car.damage > 0;
+    if (inSlot && worldSpd < 30 && needsService) {
         if (!car.pitStopActive) {
-            // Duration: base 2-5s + extra for damage repair
             car.pitStopActive = true;
             const repairExtra = car.damage > 5 ? (car.damage / 100) * 4 : 0;
-            car.pitStopDuration = 2 + Math.random() * 3 + repairExtra;
+            car.pitStopDuration = 2 + Math.random() * 3 + repairExtra + car.pitPenalty;
             car.pitStopTimer = car.pitStopDuration;
+            car.pitPenalty = 0;
         }
         car.inPit = true;
         car.pitStopTimer -= dt;
-        // Lock the car in place during pit stop
         car.vx = 0; car.vy = 0;
         fwd = 0;
         if (car.pitStopTimer <= 0) {
-            // Pit stop complete: new tires + full repair
             car.tireWear = 100;
             car.damage = 0;
             car.smokeParticles = [];
@@ -2574,11 +2644,9 @@ function updateCar(dt, trackPts) {
         }
     } else {
         if (car.pitStopActive && car.pitStopTimer <= 0) {
-            // Finished, allow driving away
             car.pitStopActive = false;
         }
-        if (!inSlot) {
-            car.pitStopActive = false;
+        if (!car.pitStopActive) {
             car.pitStopTimer = 0;
         }
         car.inPit = car.pitStopActive;
@@ -2592,6 +2660,9 @@ function updateCar(dt, trackPts) {
         car.vx = 0;
         car.vy = 0;
     }
+
+    // ---- Penalty message timer ----
+    if (car.penaltyMsgTimer > 0) car.penaltyMsgTimer -= dt;
 
     // ---- Finish line detection ----
     checkFinishLine(trackPts);
@@ -2609,6 +2680,31 @@ function updateCar(dt, trackPts) {
     const dmgColor = dmgPercent < 30 ? '#0f0' : dmgPercent < 60 ? '#ff0' : '#f44';
     const dmgText = car.damage >= 100 ? '<span style="color:#f00">TOTALSCHADEN</span> <span style="color:#aaa;font-size:12px;">[R] Reparieren</span>' : `Schaden: <span style="color:${dmgColor}">${dmgPercent}%</span>`;
     document.getElementById('race-damage').innerHTML = dmgText;
+    // Box warning
+    const warnEl = document.getElementById('race-warning');
+    if (tirePercent <= 15 && dmgPercent >= 10) {
+        warnEl.textContent = 'Box this Round - Box for tyre change & Box to repair';
+        warnEl.style.display = 'block';
+    } else if (tirePercent <= 15) {
+        warnEl.textContent = 'Box this Round - Box for tyre change';
+        warnEl.style.display = 'block';
+    } else if (dmgPercent >= 10) {
+        warnEl.textContent = 'Box this Round - Box to repair';
+        warnEl.style.display = 'block';
+    } else {
+        warnEl.style.display = 'none';
+    }
+    // Pit limiter indicator
+    document.getElementById('race-pitlimiter').style.display = car.pitLimiter ? 'block' : 'none';
+
+    // Penalty message
+    const penaltyEl = document.getElementById('race-penalty');
+    if (car.penaltyMsgTimer > 0) {
+        penaltyEl.textContent = car.penaltyMsg;
+        penaltyEl.style.display = 'block';
+    } else {
+        penaltyEl.style.display = 'none';
+    }
     if (car.pitStopActive && car.pitStopTimer > 0) {
         const remaining = car.pitStopTimer.toFixed(1);
         const total = car.pitStopDuration.toFixed(1);
