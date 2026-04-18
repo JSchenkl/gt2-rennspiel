@@ -97,6 +97,22 @@
         }
         .track-card:hover .delete-btn.visible { display: flex; }
 
+        /* Grid selector */
+        .grid-btn {
+            padding: 8px 14px;
+            font-size: 14px;
+            font-weight: 700;
+            border: 2px solid #444;
+            border-radius: 6px;
+            cursor: pointer;
+            background: transparent;
+            color: #aaa;
+            transition: all 0.15s;
+            letter-spacing: 1px;
+        }
+        .grid-btn:hover { border-color: #fff; color: #fff; }
+        .grid-btn.selected { border-color: #ffcc00; color: #ffcc00; background: rgba(255,204,0,0.12); }
+
         /* Menu buttons */
         .menu-buttons {
             display: flex; gap: 16px;
@@ -250,12 +266,28 @@
                 <input type="checkbox" id="ideal-line-mode" style="margin-right:6px;cursor:pointer;">
                 Ideallinie
             </label>
+            &nbsp;&nbsp;
+            <label style="color:#ccc;font-size:15px;cursor:pointer;">
+                <input type="checkbox" id="ai-mode" style="margin-right:6px;cursor:pointer;" checked>
+                KI-Gegner
+            </label>
         </div>
         <div style="margin-bottom:16px;display:flex;align-items:center;gap:10px;justify-content:center;">
             <label style="font-size:14px;color:#aaa;">Name:</label>
             <input id="player-name" type="text" maxlength="16" value="Fahrer1"
                 style="background:#1a1a3e;border:1px solid #444;color:#fff;padding:6px 12px;border-radius:6px;font-size:14px;width:140px;outline:none;">
             <span id="mp-status" style="font-size:12px;color:#666;">&#9679; Offline</span>
+        </div>
+        <div style="margin-bottom:20px;text-align:center;">
+            <div style="font-size:13px;color:#aaa;margin-bottom:8px;letter-spacing:2px;">STARTPOSITION</div>
+            <div style="display:flex;gap:8px;justify-content:center;" id="grid-selector">
+                <button class="grid-btn selected" data-pos="0">P1</button>
+                <button class="grid-btn" data-pos="1">P2</button>
+                <button class="grid-btn" data-pos="2">P3</button>
+                <button class="grid-btn" data-pos="3">P4</button>
+                <button class="grid-btn" data-pos="4">P5</button>
+                <button class="grid-btn" data-pos="5">P6</button>
+            </div>
         </div>
         <div class="menu-buttons">
             <button class="menu-btn race" id="btn-race">Rennen starten</button>
@@ -340,6 +372,9 @@ let idealLineMode = false;
 let soundEnabled = false;
 const rainDrops = [];
 let selectedTrackId = 'track8';
+let selectedGridPos = 0; // 0 = P1
+let raceStartTimer = 0;  // counts up to 5s before KI starts
+let raceStarted = false;
 
 // ---- Camera ----
 const cam = { x: 0, y: 0, zoom: 0.9, angle: 0 };
@@ -372,18 +407,20 @@ window.addEventListener('keyup', e => { keys[e.key] = false; });
 
 // ---- Gamepad (Xbox Controller) ----
 const GAMEPAD_DEADZONE = 0.15;
-let gpState = { steer: 0, accel: 0, brake: 0, cameraToggle: false, repair: false, menu: false };
+let gpState = { steer: 0, accel: 0, brake: 0, cameraToggle: false, repair: false, menu: false, pitLimiter: false };
 let gpCameraPrev = false; // edge detection for camera button
 let gpRepairPrev = false; // edge detection for repair button
 let gpMenuPrev = false;   // edge detection for menu button
 let gpConfirmPrev = false; // edge detection for confirm button
+let gpPitLimiterPrev = false; // edge detection for pit limiter button
 let gpDpadPrev = { up: false, down: false, left: false, right: false };
 
 // Menu gamepad navigation
 // 2D grid: rows = up/down, cols = left/right within a row
 const MENU_GRID = [
     ['tracks'],
-    ['rain', 'night', 'idealline'],
+    ['rain', 'night', 'idealline', 'aimode'],
+    ['gridpos'],
     ['btn-race', 'btn-view', 'btn-edit']
 ];
 let menuCursorRow = 0;
@@ -393,7 +430,7 @@ let menuShowCursor = false;
 function pollGamepad() {
     const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
     const gp = gamepads[0];
-    if (!gp) { gpState.steer = 0; gpState.accel = 0; gpState.brake = 0; gpState.cameraToggle = false; gpState.repair = false; gpState.menu = false; return; }
+    if (!gp) { gpState.steer = 0; gpState.accel = 0; gpState.brake = 0; gpState.cameraToggle = false; gpState.repair = false; gpState.menu = false; gpState.pitLimiter = false; return; }
 
     // Left stick X axis (axis 0): steering
     let steer = gp.axes[0] || 0;
@@ -424,6 +461,11 @@ function pollGamepad() {
     const menuBtn = gp.buttons[3] ? gp.buttons[3].pressed : false;
     gpState.menu = menuBtn && !gpMenuPrev;
     gpMenuPrev = menuBtn;
+
+    // X button (2) - toggle pit limiter (edge triggered)
+    const pitLimBtn = gp.buttons[2] ? gp.buttons[2].pressed : false;
+    gpState.pitLimiter = pitLimBtn && !gpPitLimiterPrev;
+    gpPitLimiterPrev = pitLimBtn;
 
     // D-Pad: up(12), down(13), left(14), right(15)
     gpState.dpadUp = gp.buttons[12] ? gp.buttons[12].pressed : false;
@@ -1021,7 +1063,7 @@ function getGridPositions(pts, normals) {
     const flen = Math.sqrt(fdx * fdx + fdy * fdy) || 1;
     // Backward direction (before start line)
     const bx = -fdx / flen, by = -fdy / flen;
-    const ROW_SPACING = 55;
+    const ROW_SPACING = 100;
     const SIDE_OFFSET = TRACK_WIDTH * 0.32;
     const positions = [];
     for (let i = 0; i < 6; i++) {
@@ -1365,6 +1407,16 @@ function buildMenu() {
         container.appendChild(card);
     }
 
+    // Grid selector buttons
+    document.querySelectorAll('.grid-btn').forEach(btn => {
+        btn.classList.toggle('selected', parseInt(btn.dataset.pos) === selectedGridPos);
+        btn.onclick = () => {
+            selectedGridPos = parseInt(btn.dataset.pos);
+            document.querySelectorAll('.grid-btn').forEach(b => b.classList.remove('selected'));
+            btn.classList.add('selected');
+        };
+    });
+
     // Update button states
     const trackData = getTrackData(selectedTrackId);
     const isBuiltin = TRACKS.find(t => t.id === selectedTrackId)?.builtin;
@@ -1386,6 +1438,11 @@ document.getElementById('btn-race').addEventListener('click', () => {
     activeTrack = data;
     activeDecorations = generateDecorations(data.points, data.normals);
     initCar(data);
+    const aiEnabled = document.getElementById('ai-mode').checked;
+    const gridForAI = getGridPositions(data.points, data.normals);
+    initAICars(data, aiEnabled ? gridForAI : []);
+    raceStartTimer = 0;
+    raceStarted = false;
     cam.zoom = 1.8;
     cam.angle = 0;
     camAngleSmooth = 0;
@@ -1438,6 +1495,10 @@ function updateMenuCursor() {
         el = document.getElementById('night-mode').parentElement;
     } else if (item === 'idealline') {
         el = document.getElementById('ideal-line-mode').parentElement;
+    } else if (item === 'aimode') {
+        el = document.getElementById('ai-mode').parentElement;
+    } else if (item === 'gridpos') {
+        el = document.querySelector('.grid-btn.selected');
     } else {
         el = document.getElementById(item);
     }
@@ -1878,12 +1939,12 @@ const lapTimer = {
 function initCar(trackData) {
     const pts = trackData.points;
     const normals = trackData.normals;
-    // Place car on P1 grid position
+    // Place car on selected grid position
     const grid = getGridPositions(pts, normals);
-    const p1 = grid[0];
-    car.x = p1.x;
-    car.y = p1.y;
-    car.angle = p1.angle;
+    const startPos = grid[Math.min(selectedGridPos, grid.length - 1)];
+    car.x = startPos.x;
+    car.y = startPos.y;
+    car.angle = startPos.angle;
     const next = pts[1];
     const prev = pts[pts.length - 1];
     car.vx = 0; car.vy = 0;
@@ -3348,6 +3409,9 @@ function drawRace() {
     // Draw rim sparks (behind car, in world space)
     drawRimSparks();
 
+    // Draw AI cars
+    drawAICars();
+
     // Draw remote players (behind local car)
     drawRemotePlayers();
 
@@ -3443,6 +3507,73 @@ function drawRace() {
     // HUD overlays (not rotated)
     drawMinimap(activeTrack.points);
     drawCarOnMinimap();
+    if (!raceStarted) drawStartLights();
+}
+
+function drawStartLights() {
+    const w = canvas.width, h = canvas.height;
+    const t = raceStartTimer; // 0..5
+
+    // How many red lights are on (1 per second, 5 total)
+    const lightsOn = Math.min(5, Math.floor(t));
+    const isGreen = t >= 4.5 && t < 5;
+
+    // Panel background
+    const panelW = 260, panelH = 90;
+    const px = w / 2 - panelW / 2, py = 60;
+    ctx.fillStyle = 'rgba(0,0,0,0.82)';
+    ctx.beginPath();
+    ctx.roundRect(px, py, panelW, panelH, 12);
+    ctx.fill();
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // 5 lights
+    const lightR = 18, gap = 10;
+    const totalW = 5 * lightR * 2 + 4 * gap;
+    const startX = w / 2 - totalW / 2 + lightR;
+    const ly = py + panelH / 2;
+
+    for (let i = 0; i < 5; i++) {
+        const lx = startX + i * (lightR * 2 + gap);
+        ctx.beginPath();
+        ctx.arc(lx, ly, lightR, 0, Math.PI * 2);
+
+        if (isGreen) {
+            ctx.fillStyle = '#00e040';
+            ctx.shadowColor = '#00ff60';
+            ctx.shadowBlur = 20;
+        } else if (i < lightsOn) {
+            ctx.fillStyle = '#e02020';
+            ctx.shadowColor = '#ff3030';
+            ctx.shadowBlur = 18;
+        } else {
+            ctx.fillStyle = '#1a1a1a';
+            ctx.shadowBlur = 0;
+        }
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // Ring
+        ctx.strokeStyle = '#555';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    }
+
+    // Text
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    if (isGreen) {
+        ctx.fillStyle = '#00ff60';
+        ctx.font = 'bold 20px sans-serif';
+        ctx.fillText('GO!', w / 2, py + panelH + 8);
+    } else {
+        ctx.fillStyle = '#aaa';
+        ctx.fillText(`Start in ${Math.max(0, Math.ceil(5 - t))}s`, w / 2, py + panelH + 8);
+    }
 }
 
 function drawCarOnMinimap() {
@@ -3522,6 +3653,15 @@ function update(time) {
                     selectedTrackId = TRACKS[newIdx].id;
                     buildMenu();
                 }
+            } else if (item === 'gridpos') {
+                if (dLeft || dRight) {
+                    const btns = Array.from(document.querySelectorAll('.grid-btn'));
+                    const curIdx = btns.findIndex(b => b.classList.contains('selected'));
+                    const newIdx = dRight ? (curIdx + 1) % btns.length : (curIdx - 1 + btns.length) % btns.length;
+                    btns.forEach(b => b.classList.remove('selected'));
+                    btns[newIdx].classList.add('selected');
+                    selectedGridPos = newIdx;
+                }
             } else {
                 if (dLeft) menuCursorCol = (menuCursorCol - 1 + MENU_GRID[menuCursorRow].length) % MENU_GRID[menuCursorRow].length;
                 if (dRight) menuCursorCol = (menuCursorCol + 1) % MENU_GRID[menuCursorRow].length;
@@ -3539,6 +3679,17 @@ function update(time) {
                 } else if (currentItem === 'idealline') {
                     const cb = document.getElementById('ideal-line-mode');
                     cb.checked = !cb.checked;
+                } else if (currentItem === 'aimode') {
+                    const cb = document.getElementById('ai-mode');
+                    cb.checked = !cb.checked;
+                } else if (currentItem === 'gridpos') {
+                    // A auf gridpos = nächste Position (wie Rechts)
+                    const btns = Array.from(document.querySelectorAll('.grid-btn'));
+                    const curIdx = btns.findIndex(b => b.classList.contains('selected'));
+                    const newIdx = (curIdx + 1) % btns.length;
+                    btns.forEach(b => b.classList.remove('selected'));
+                    btns[newIdx].classList.add('selected');
+                    selectedGridPos = newIdx;
                 } else if (currentItem === 'btn-race') {
                     document.getElementById('btn-race').click();
                 } else if (currentItem === 'btn-view') {
@@ -3566,6 +3717,9 @@ function update(time) {
     if (gpState.menu && currentMode !== 'menu') {
         switchMode('menu');
     }
+    if (gpState.pitLimiter && currentMode === 'race') {
+        car.pitLimiter = !car.pitLimiter;
+    }
 
     if (currentMode === 'race' && activeTrack) {
         // Race mode: WASD/Gamepad controls car, arrows + zoom for camera
@@ -3573,6 +3727,16 @@ function update(time) {
         if (keys['-']) cam.zoom /= 1.02;
         cam.zoom = Math.max(0.5, Math.min(4, cam.zoom));
         updateCar(dt, activeTrack.points);
+        if (!raceStarted) {
+            raceStartTimer += dt;
+            if (raceStartTimer >= 5) raceStarted = true;
+        }
+        if (aiIdealLine) {
+            if (raceStarted) {
+                for (const ai of aiCars) updateAICar(ai, dt, aiIdealLine);
+            }
+            checkAICollisions(dt);
+        }
         mpSendState();
         updateRimSparks(dt);
         drawRace();
@@ -3606,6 +3770,233 @@ function update(time) {
 // ---- Init ----
 buildMenu();
 requestAnimationFrame(update);
+
+// =====================================================================
+//  KI-GEGNER
+// =====================================================================
+const AI_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6'];
+let aiCars = [];
+let aiIdealLine = null; // cached ideal line world points
+
+function computeIdealLinePoints(pts, normals, curvature) {
+    if (!curvature) return pts.map(p => ({ x: p.x, y: p.y }));
+    const n = pts.length;
+    const offsets = new Float32Array(n);
+    const maxOffset = TRACK_WIDTH * 0.65;
+    for (let i = 0; i < n; i++) {
+        const r = curvature[i].radius;
+        const sign = curvature[i].sign;
+        const t = Math.max(0, 1 - r / 600);
+        offsets[i] = -sign * t * maxOffset;
+    }
+    for (let pass = 0; pass < 20; pass++) {
+        for (let i = 0; i < n; i++) {
+            const prev = offsets[(i - 1 + n) % n];
+            const next = offsets[(i + 1) % n];
+            offsets[i] = offsets[i] * 0.5 + (prev + next) * 0.25;
+        }
+    }
+    return pts.map((p, i) => ({
+        x: p.x + normals[i].x * offsets[i],
+        y: p.y + normals[i].y * offsets[i],
+        curvRadius: curvature[i].radius,
+    }));
+}
+
+function initAICars(trackData, grid) {
+    aiCars = [];
+    aiIdealLine = computeIdealLinePoints(trackData.points, trackData.normals, trackData.curvature);
+    for (let i = 0; i < 5; i++) {
+        const gridPos = grid[i + 1]; // P2–P6 (skip P1 = player)
+        if (!gridPos) continue;
+        // Find closest ideal line index to start position
+        let bestIdx = 0, bestDist = Infinity;
+        for (let j = 0; j < aiIdealLine.length; j++) {
+            const dx = aiIdealLine[j].x - gridPos.x;
+            const dy = aiIdealLine[j].y - gridPos.y;
+            const d = dx * dx + dy * dy;
+            if (d < bestDist) { bestDist = d; bestIdx = j; }
+        }
+        aiCars.push({
+            x: gridPos.x, y: gridPos.y, angle: gridPos.angle,
+            vx: 0, vy: 0, angularVel: 0,
+            width: 30, length: 50,
+            color: AI_COLORS[i],
+            trackIdx: bestIdx,
+            damage: 0, tireWear: 100,
+            speed: 0,
+        });
+    }
+}
+
+function updateAICar(ai, dt, ilPts) {
+    const n = ilPts.length;
+
+    // --- 1. Advance trackIdx forward along ideal line ---
+    // Search forward from current index to find closest point
+    const searchFwd = Math.max(40, Math.floor(ai.speed * dt * 4 + 30));
+    let closestIdx = ai.trackIdx;
+    let closestDist = Infinity;
+    for (let di = -3; di <= searchFwd; di++) {
+        const idx = (ai.trackIdx + di + n) % n;
+        const dx = ilPts[idx].x - ai.x, dy = ilPts[idx].y - ai.y;
+        const d = dx * dx + dy * dy;
+        if (d < closestDist) { closestDist = d; closestIdx = idx; }
+    }
+    ai.trackIdx = closestIdx;
+
+    // --- 2. Measure curvature ahead (next ~80px) to adapt lookahead ---
+    let nearTurn = 0;
+    let nearIdx = ai.trackIdx;
+    let nearWalked = 0;
+    for (let step = 0; step < n && nearWalked < 80; step++) {
+        const nxt = (nearIdx + 1) % n;
+        const dx = ilPts[nxt].x - ilPts[nearIdx].x;
+        const dy = ilPts[nxt].y - ilPts[nearIdx].y;
+        nearWalked += Math.sqrt(dx * dx + dy * dy);
+        if (step > 0) {
+            const pdx = ilPts[nearIdx].x - ilPts[(nearIdx - 1 + n) % n].x;
+            const pdy = ilPts[nearIdx].y - ilPts[(nearIdx - 1 + n) % n].y;
+            let da = Math.abs(Math.atan2(dy, dx) - Math.atan2(pdy, pdx));
+            if (da > Math.PI) da = Math.PI * 2 - da;
+            nearTurn += da;
+        }
+        nearIdx = nxt;
+    }
+    // Short lookahead in corners, longer on straights
+    const LOOKAHEAD = nearTurn > 0.15 ? 40 : 80 + ai.speed * 0.08;
+
+    let lookaheadIdx = ai.trackIdx;
+    let walked = 0;
+    for (let step = 0; step < n; step++) {
+        const nextIdx = (lookaheadIdx + 1) % n;
+        const dx = ilPts[nextIdx].x - ilPts[lookaheadIdx].x;
+        const dy = ilPts[nextIdx].y - ilPts[lookaheadIdx].y;
+        walked += Math.sqrt(dx * dx + dy * dy);
+        lookaheadIdx = nextIdx;
+        if (walked >= LOOKAHEAD) break;
+    }
+    const target = ilPts[lookaheadIdx];
+
+    // --- 3. Steer aggressively toward target ---
+    const desiredAngle = Math.atan2(target.y - ai.y, target.x - ai.x);
+    let angleDiff = desiredAngle - ai.angle;
+    while (angleDiff >  Math.PI) angleDiff -= Math.PI * 2;
+    while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+    // In corners: steer hard. On straights: gentle correction.
+    const steerStrength = nearTurn > 0.15 ? 9.0 : 5.0;
+    ai.angle += angleDiff * steerStrength * dt;
+
+    // --- 4. Speed: look ahead ~300px for curve angle ---
+    let maxTurn = 0;
+    let checkIdx = ai.trackIdx;
+    let checkWalked = 0;
+    for (let step = 0; step < n && checkWalked < 300; step++) {
+        const nextIdx = (checkIdx + 1) % n;
+        const dx = ilPts[nextIdx].x - ilPts[checkIdx].x;
+        const dy = ilPts[nextIdx].y - ilPts[checkIdx].y;
+        checkWalked += Math.sqrt(dx * dx + dy * dy);
+        // Angle change at this point
+        if (step > 0) {
+            const a1 = Math.atan2(dy, dx);
+            const prevIdx = checkIdx;
+            const pdx = ilPts[checkIdx].x - ilPts[(checkIdx - 1 + n) % n].x;
+            const pdy = ilPts[checkIdx].y - ilPts[(checkIdx - 1 + n) % n].y;
+            const a0 = Math.atan2(pdy, pdx);
+            let da = Math.abs(a1 - a0);
+            if (da > Math.PI) da = Math.PI * 2 - da;
+            if (da > maxTurn) maxTurn = da;
+        }
+        checkIdx = nextIdx;
+    }
+    // maxTurn in [0..π]: 0 = straight, high = sharp corner
+    const cornerFactor = Math.min(1, maxTurn / 0.25);
+    const targetSpeed = CAR_MAX_SPEED - cornerFactor * 530; // same top speed as player, ~360 on hairpin
+    const accel = ai.speed < targetSpeed ? 420 : -900;
+    ai.speed = Math.max(0, Math.min(CAR_MAX_SPEED, ai.speed + accel * dt));
+
+    // --- 5. Move ---
+    ai.x += Math.cos(ai.angle) * ai.speed * dt;
+    ai.y += Math.sin(ai.angle) * ai.speed * dt;
+    ai.vx = Math.cos(ai.angle) * ai.speed;
+    ai.vy = Math.sin(ai.angle) * ai.speed;
+}
+
+function checkAICollisions(dt) {
+    for (const ai of aiCars) {
+        const dx = car.x - ai.x, dy = car.y - ai.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const minDist = (car.width + ai.width) * 0.6;
+        if (dist < minDist && dist > 0) {
+            // Push apart
+            const nx = dx / dist, ny = dy / dist;
+            const overlap = minDist - dist;
+            car.x += nx * overlap * 0.6;
+            car.y += ny * overlap * 0.6;
+            ai.x -= nx * overlap * 0.4;
+            ai.y -= ny * overlap * 0.4;
+
+            // Relative velocity along impact normal
+            const relVx = car.vx - ai.vx, relVy = car.vy - ai.vy;
+            const impact = Math.abs(relVx * nx + relVy * ny);
+
+            if (impact > 80) {
+                // Damage proportional to impact
+                const dmg = impact * 0.04;
+                car.damage = Math.min(100, car.damage + dmg);
+                ai.damage = Math.min(100, ai.damage + dmg * 0.5);
+
+                // Bounce player
+                const dot = car.vx * nx + car.vy * ny;
+                car.vx -= dot * nx * 1.2;
+                car.vy -= dot * ny * 1.2;
+
+                // 5-second penalty if damage > 7%
+                if (dmg > 7 && car.penaltyMsgTimer <= 0) {
+                    car.pitPenalty += 5;
+                    car.penaltyMsg = 'You have a 5 second time penalty for that';
+                    car.penaltyMsgTimer = 5;
+                }
+            }
+        }
+    }
+}
+
+function drawAICar(ai) {
+    const halfL = ai.length / 2, halfW = ai.width / 2;
+    ctx.save();
+    ctx.translate(ai.x, ai.y);
+    ctx.rotate(ai.angle);
+
+    // Shadow
+    ctx.save();
+    ctx.translate(2, 2);
+    ctx.beginPath(); drawCarBody(halfL, halfW);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.fill();
+    ctx.restore();
+
+    // Body
+    ctx.beginPath(); drawCarBody(halfL, halfW);
+    ctx.fillStyle = ai.damage >= 100 ? '#555' : ai.color;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1; ctx.stroke();
+
+    // Windshield
+    ctx.beginPath();
+    ctx.moveTo(halfL * 0.18, -halfW + 3);
+    ctx.lineTo(halfL * 0.05, -halfW + 2.5);
+    ctx.lineTo(halfL * 0.05,  halfW - 2.5);
+    ctx.lineTo(halfL * 0.18,  halfW - 3);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fill();
+
+    ctx.restore();
+}
+
+function drawAICars() {
+    for (const ai of aiCars) drawAICar(ai);
+}
 
 // =====================================================================
 //  MULTIPLAYER
