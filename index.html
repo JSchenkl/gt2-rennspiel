@@ -290,7 +290,8 @@
             </div>
         </div>
         <div class="menu-buttons">
-            <button class="menu-btn race" id="btn-race">Rennen starten</button>
+            <button class="menu-btn race" id="btn-race">Zeitfahren</button>
+            <button class="menu-btn race" id="btn-race-laps" style="background:linear-gradient(135deg,#b8860b,#ffd700);">Rennen (8 Runden)</button>
             <button class="menu-btn view" id="btn-view">Strecke anschauen</button>
             <button class="menu-btn edit" id="btn-edit">Strecke editieren</button>
         </div>
@@ -313,6 +314,7 @@
         <div id="race-damage" style="font-size:15px;font-weight:bold;margin-top:4px;font-variant-numeric:tabular-nums;">Schaden: <span style="color:#0f0">0%</span></div>
         <div id="race-pit" style="font-size:14px;color:#0ff;font-weight:bold;margin-top:2px;"></div>
         <div id="race-pitlimiter" style="font-size:14px;color:#ff0;font-weight:bold;margin-top:2px;display:none;">PIT LIMITER aktiv [V]</div>
+        <div id="race-laps" style="font-size:18px;font-weight:bold;color:#ff0;margin-top:4px;display:none;"></div>
         <div id="race-warning" style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#fff;color:#111;font-size:22px;font-weight:bold;padding:14px 80px;border-radius:8px;display:none;text-align:center;letter-spacing:1px;box-shadow:0 2px 12px #0006;"></div>
         <div id="race-penalty" style="position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:#c00;color:#fff;font-size:22px;font-weight:bold;padding:14px 80px;border-radius:8px;display:none;text-align:center;letter-spacing:1px;box-shadow:0 2px 12px #0006;"></div>
         <div id="race-drift" style="font-size:13px;color:#f84;font-weight:bold;margin-top:2px;"></div>
@@ -375,6 +377,12 @@ let selectedTrackId = 'track8';
 let selectedGridPos = 0; // 0 = P1
 let raceStartTimer = 0;  // counts up to 5s before KI starts
 let raceStarted = false;
+let raceMode = 'time';   // 'time' | 'laps'
+const RACE_TOTAL_LAPS = 8;
+let playerLapCount = 0;
+let raceFinished = false;
+let raceResults = [];       // filled when race ends: [{name, color, finishTime, laps}]
+let raceStartTime = 0;      // performance.now() when lights go green
 
 // ---- Camera ----
 const cam = { x: 0, y: 0, zoom: 0.9, angle: 0 };
@@ -421,7 +429,7 @@ const MENU_GRID = [
     ['tracks'],
     ['rain', 'night', 'idealline', 'aimode'],
     ['gridpos'],
-    ['btn-race', 'btn-view', 'btn-edit']
+    ['btn-race', 'btn-race-laps', 'btn-view', 'btn-edit']
 ];
 let menuCursorRow = 0;
 let menuCursorCol = 0;
@@ -1063,8 +1071,8 @@ function getGridPositions(pts, normals) {
     const flen = Math.sqrt(fdx * fdx + fdy * fdy) || 1;
     // Backward direction (before start line)
     const bx = -fdx / flen, by = -fdy / flen;
-    const ROW_SPACING = 100;
-    const SIDE_OFFSET = TRACK_WIDTH * 0.32;
+    const ROW_SPACING = 140;
+    const SIDE_OFFSET = TRACK_WIDTH * 0.42;
     const positions = [];
     for (let i = 0; i < 6; i++) {
         const row = Math.floor(i / 2);
@@ -1427,7 +1435,12 @@ function buildMenu() {
 }
 
 // ---- Menu button handlers ----
-document.getElementById('btn-race').addEventListener('click', () => {
+function startRace(mode) {
+    raceMode = mode;
+    playerLapCount = 0;
+    raceFinished = false;
+    raceResults = [];
+    raceStartTime = 0;
     rainMode = document.getElementById('rain-mode').checked;
     nightMode = document.getElementById('night-mode').checked;
     idealLineMode = document.getElementById('ideal-line-mode').checked;
@@ -1450,8 +1463,17 @@ document.getElementById('btn-race').addEventListener('click', () => {
     cameraMode = 'top';
     camVX = 0; camVY = 0;
     updateCameraHud();
+    const lapEl = document.getElementById('race-laps');
+    if (raceMode === 'laps') {
+        lapEl.textContent = `Runde 0 / ${RACE_TOTAL_LAPS}`;
+        lapEl.style.display = 'block';
+    } else {
+        lapEl.style.display = 'none';
+    }
     switchMode('race');
-});
+}
+document.getElementById('btn-race').addEventListener('click', () => startRace('time'));
+document.getElementById('btn-race-laps').addEventListener('click', () => startRace('laps'));
 
 document.getElementById('btn-view').addEventListener('click', () => {
     const data = getTrackData(selectedTrackId);
@@ -1877,6 +1899,7 @@ const car = {
     pitStopTimer: 0,     // seconds remaining for tire change
     pitStopActive: false,
     pitStopDuration: 0,  // total duration of current pit stop
+    pitGreenTimer: 0,    // seconds the green light stays visible after service
     damage: 0,           // 0 = no damage, 100 = totaled
     smokeParticles: [],
     pitLimiter: false,
@@ -1959,6 +1982,7 @@ function initCar(trackData) {
     car.pitStopTimer = 0;
     car.pitStopActive = false;
     car.pitStopDuration = 0;
+    car.pitGreenTimer = 0;
     car.damage = 0;
     car.smokeParticles = [];
     car.pitLimiter = false;
@@ -2017,17 +2041,23 @@ function checkFinishLine(trackPts) {
     const now = performance.now();
 
     if (!lapTimer.running) {
-        // First crossing: start the timer
         lapTimer.running = true;
         lapTimer.startTime = now;
         lapTimer.crossedAway = false;
     } else {
-        // Lap complete
         const lapTime = now - lapTimer.startTime;
         lapTimer.lastTime = lapTime;
         if (lapTime < lapTimer.bestTime) lapTimer.bestTime = lapTime;
         lapTimer.startTime = now;
         lapTimer.crossedAway = false;
+        if (raceMode === 'laps' && !raceFinished) {
+            playerLapCount++;
+            document.getElementById('race-laps').textContent = `Runde ${playerLapCount} / ${RACE_TOTAL_LAPS}`;
+            if (playerLapCount >= RACE_TOTAL_LAPS) {
+                raceFinished = true;
+                buildRaceResults(performance.now() - raceStartTime);
+            }
+        }
     }
 }
 
@@ -2573,8 +2603,8 @@ function updateCar(dt, trackPts) {
         const accelMult = gpAccelAmount > 0.1 ? gpAccelAmount : 1.0;
         let power = CAR_POWER;
         // Worn tires: less power (rubber gone, metal rims = bad traction)
-        if (car.tireWear < 10) {
-            power *= 0.4 + 0.6 * (car.tireWear / 10);
+        if (car.tireWear <= 0) {
+            power *= 0.4;
         }
         // Above ~250 km/h: power drops off progressively (air resistance / top-end)
         if (fwd > CAR_POWER_FALLOFF_START) {
@@ -2599,7 +2629,7 @@ function updateCar(dt, trackPts) {
     const drag = onTrack ? SURFACE_DRAG : GRASS_DRAG;
     fwd *= Math.max(0, 1 - drag * dt);
     // Worn tires reduce top speed (driving on rims)
-    const tireSpeedMult = car.tireWear < 10 ? 0.55 + 0.45 * (car.tireWear / 10) : 1.0;
+    const tireSpeedMult = car.tireWear <= 0 ? 0.55 : 1.0;
     const damageMaxSpeed = CAR_MAX_SPEED * (1 - car.damage * 0.005) * tireSpeedMult;
     fwd = Math.max(CAR_MAX_REVERSE, Math.min(damageMaxSpeed, fwd));
 
@@ -2641,7 +2671,7 @@ function updateCar(dt, trackPts) {
     // When lateral speed exceeds what grip can handle -> car slides!
     let availableGrip = GRIP_MAX * gripMult;
     // Tire wear: full grip above 20%, then drops to 15% at 0% (metal on asphalt)
-    const wearGrip = car.tireWear >= 20 ? 1.0 : 0.15 + 0.85 * (car.tireWear / 20);
+    const wearGrip = car.tireWear > 0 ? 1.0 : 0.15;
     availableGrip *= wearGrip;
     if (rainMode) availableGrip *= 0.6;  // wet track = less grip
     if (isBraking) availableGrip *= GRIP_BRAKE_MULT;
@@ -2740,7 +2770,7 @@ function updateCar(dt, trackPts) {
     // ---- Pit stop detection (only in slots) ----
     const worldSpd = Math.sqrt(car.vx * car.vx + car.vy * car.vy);
     const inSlot = isInPitSlot(car.x, car.y, trackPts, activeTrack ? activeTrack.normals : null);
-    const needsService = car.tireWear < 100 || car.damage > 0;
+    const needsService = car.tireWear < 98 || car.damage > 1;
     if (inSlot && worldSpd < 30 && needsService) {
         if (!car.pitStopActive) {
             car.pitStopActive = true;
@@ -2754,17 +2784,25 @@ function updateCar(dt, trackPts) {
         car.vx = 0; car.vy = 0;
         fwd = 0;
         if (car.pitStopTimer <= 0) {
-            car.tireWear = 100;
-            car.damage = 0;
-            car.smokeParticles = [];
+            if (car.tireWear < 100 || car.damage > 0) {
+                car.tireWear = 100;
+                car.damage = 0;
+                car.smokeParticles = [];
+                car.pitGreenTimer = 2;
+            }
             car.pitStopTimer = 0;
         }
     } else {
         if (car.pitStopActive && car.pitStopTimer <= 0) {
-            car.pitStopActive = false;
+            if (car.pitGreenTimer > 0) {
+                car.pitGreenTimer -= dt;
+            } else {
+                car.pitStopActive = false;
+            }
         }
         if (!car.pitStopActive) {
             car.pitStopTimer = 0;
+            car.pitGreenTimer = 0;
         }
         car.inPit = car.pitStopActive;
     }
@@ -3118,9 +3156,9 @@ function drawCar() {
             ctx.save();
             ctx.translate(wp.x, wp.y);
             if (wp.front) ctx.rotate(car.steerAngle * 4);
-            if (car.tireWear < 10) {
+            if (car.tireWear <= 0) {
                 // Metal rims - no rubber left
-                const rimMix = 1 - car.tireWear / 10;
+                const rimMix = 1;
                 const r1 = Math.round(26 + rimMix * (160 - 26));
                 const r2 = Math.round(26 + rimMix * (140 - 26));
                 const g1 = Math.round(26 + rimMix * (165 - 26));
@@ -3243,8 +3281,8 @@ function drawCar() {
     }
 
     // ---- Tire sparks: spawn world-space particles when tires are destroyed ----
-    if (car.tireWear < 10 && Math.abs(car.vx) + Math.abs(car.vy) > 30) {
-        const sparkIntensity = 1 - car.tireWear / 10;
+    if (car.tireWear <= 0 && Math.abs(car.vx) + Math.abs(car.vy) > 30) {
+        const sparkIntensity = 1;
         const sparkCount = Math.ceil(sparkIntensity * 4);
         const cosA = Math.cos(car.angle), sinA = Math.sin(car.angle);
         for (let i = 0; i < sparkCount; i++) {
@@ -3508,6 +3546,8 @@ function drawRace() {
     drawMinimap(activeTrack.points);
     drawCarOnMinimap();
     if (!raceStarted) drawStartLights();
+    if (car.inPit || (car.pitStopActive && car.pitStopTimer <= 0)) drawPitLight();
+    if (raceFinished) drawRaceFinished();
 }
 
 function drawStartLights() {
@@ -3574,6 +3614,139 @@ function drawStartLights() {
         ctx.fillStyle = '#aaa';
         ctx.fillText(`Start in ${Math.max(0, Math.ceil(5 - t))}s`, w / 2, py + panelH + 8);
     }
+}
+
+function buildRaceResults(playerTime) {
+    const playerName = document.getElementById('player-name')?.value || 'Fahrer';
+    const entries = [
+        { name: playerName, color: '#e8e8ec', finishTime: playerTime, laps: playerLapCount, isPlayer: true },
+        ...aiCars.map(ai => ({
+            name: ai.name, color: ai.color,
+            finishTime: ai.finishTime,
+            laps: ai.lapCount,
+            isPlayer: false,
+        }))
+    ];
+    // Sort: finished first (by time), then by laps desc
+    entries.sort((a, b) => {
+        if (a.finishTime !== null && b.finishTime !== null) return a.finishTime - b.finishTime;
+        if (a.finishTime !== null) return -1;
+        if (b.finishTime !== null) return 1;
+        return b.laps - a.laps;
+    });
+    raceResults = entries;
+}
+
+function drawRaceFinished() {
+    const w = canvas.width, h = canvas.height;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.78)';
+    ctx.fillRect(0, 0, w, h);
+
+    // Titel
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 52px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.shadowColor = '#ff8800';
+    ctx.shadowBlur = 24;
+    ctx.fillText('ZIEL!', w / 2, 30);
+    ctx.shadowBlur = 0;
+
+    // Rangliste
+    const rowH = 44, startY = 110, panelW = 480;
+    const px = w / 2 - panelW / 2;
+
+    // Header
+    ctx.fillStyle = '#555';
+    ctx.fillRect(px, startY - 6, panelW, rowH - 6);
+    ctx.fillStyle = '#aaa';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('POS', px + 12, startY + 14);
+    ctx.fillText('FAHRER', px + 60, startY + 14);
+    ctx.fillText('RUNDEN', px + 290, startY + 14);
+    ctx.fillText('ZEIT', px + 370, startY + 14);
+
+    raceResults.forEach((entry, i) => {
+        const y = startY + rowH + i * rowH;
+        const bg = entry.isPlayer ? 'rgba(255,215,0,0.18)' : (i % 2 === 0 ? 'rgba(255,255,255,0.05)' : 'transparent');
+        ctx.fillStyle = bg;
+        ctx.fillRect(px, y, panelW, rowH - 2);
+
+        // Position medal
+        const medals = ['🥇', '🥈', '🥉'];
+        ctx.font = 'bold 18px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = i < 3 ? ['#ffd700','#ccc','#cd7f32'][i] : '#aaa';
+        ctx.fillText(medals[i] || `${i + 1}.`, px + 10, y + rowH / 2);
+
+        // Color dot
+        ctx.beginPath();
+        ctx.arc(px + 50, y + rowH / 2, 7, 0, Math.PI * 2);
+        ctx.fillStyle = entry.color;
+        ctx.fill();
+
+        // Name
+        ctx.fillStyle = entry.isPlayer ? '#ffd700' : '#fff';
+        ctx.font = entry.isPlayer ? 'bold 17px sans-serif' : '17px sans-serif';
+        ctx.fillText(entry.name, px + 64, y + rowH / 2);
+
+        // Laps
+        ctx.fillStyle = '#ccc';
+        ctx.font = '15px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${entry.laps} / ${RACE_TOTAL_LAPS}`, px + 320, y + rowH / 2);
+
+        // Time
+        ctx.textAlign = 'right';
+        ctx.fillStyle = entry.finishTime !== null ? '#0f0' : '#f84';
+        ctx.fillText(entry.finishTime !== null ? formatLapTime(entry.finishTime) : 'DNF', px + panelW - 12, y + rowH / 2);
+    });
+
+    // Hint
+    ctx.fillStyle = '#666';
+    ctx.font = '15px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Y / Menü-Taste → zurück', w / 2, startY + rowH * (raceResults.length + 2) + 10);
+    ctx.restore();
+}
+
+function drawPitLight() {
+    const green = car.pitStopActive && car.pitStopTimer <= 0;
+    const w = canvas.width;
+    const r = 28;
+    const cx = w / 2, cy = 36;
+
+    // Housing
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.beginPath();
+    ctx.roundRect(cx - r - 14, cy - r - 8, (r + 14) * 2, (r + 8) * 2, 10);
+    ctx.fill();
+    ctx.strokeStyle = '#444';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Light
+    const color = green ? '#00e040' : '#e02020';
+    const glow  = green ? '#00ff60' : '#ff3030';
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.shadowColor = glow;
+    ctx.shadowBlur = 30;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Label
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(green ? 'GO!' : 'BOX', cx, cy + r + 6);
+    ctx.restore();
 }
 
 function drawCarOnMinimap() {
@@ -3692,6 +3865,8 @@ function update(time) {
                     selectedGridPos = newIdx;
                 } else if (currentItem === 'btn-race') {
                     document.getElementById('btn-race').click();
+                } else if (currentItem === 'btn-race-laps') {
+                    document.getElementById('btn-race-laps').click();
                 } else if (currentItem === 'btn-view') {
                     document.getElementById('btn-view').click();
                 } else if (currentItem === 'btn-edit') {
@@ -3729,7 +3904,7 @@ function update(time) {
         updateCar(dt, activeTrack.points);
         if (!raceStarted) {
             raceStartTimer += dt;
-            if (raceStartTimer >= 5) raceStarted = true;
+            if (raceStartTimer >= 5) { raceStarted = true; raceStartTime = performance.now(); }
         }
         if (aiIdealLine) {
             if (raceStarted) {
@@ -3822,14 +3997,51 @@ function initAICars(trackData, grid) {
             vx: 0, vy: 0, angularVel: 0,
             width: 30, length: 50,
             color: AI_COLORS[i],
+            name: `KI ${i + 1}`,
             trackIdx: bestIdx,
             damage: 0, tireWear: 100,
             speed: 0,
+            needsPit: false,
+            hasPitted: false,
+            pitLap: 3 + Math.floor(Math.random() * 4), // pit after lap 3–6
+            pitTimer: 0,
+            lapCount: 0,
+            finishTime: null,
+            crossedAway: false,
         });
     }
 }
 
+const AI_MAX_SPEED = CAR_MAX_SPEED * 0.995;
+
 function updateAICar(ai, dt, ilPts) {
+    // --- Boxenstopp-Simulation ---
+    if (ai.needsPit) {
+        ai.speed = Math.max(0, ai.speed - 600 * dt);
+        ai.x += Math.cos(ai.angle) * ai.speed * dt;
+        ai.y += Math.sin(ai.angle) * ai.speed * dt;
+        ai.vx = Math.cos(ai.angle) * ai.speed;
+        ai.vy = Math.sin(ai.angle) * ai.speed;
+        if (ai.speed <= 0) {
+            ai.pitTimer -= dt;
+            if (ai.pitTimer <= 0) {
+                ai.tireWear = 100;
+                ai.damage = 0;
+                ai.needsPit = false;
+            }
+        }
+        return;
+    }
+
+    // Reifenverschleiß, Schaden oder geplante Pit-Runde
+    const planedPit = raceMode === 'laps' && !ai.hasPitted && ai.lapCount >= ai.pitLap;
+    if (ai.tireWear < 20 || ai.damage > 19 || planedPit) {
+        ai.needsPit = true;
+        ai.hasPitted = true;
+        ai.pitTimer = 3 + Math.random() * 3;
+        return;
+    }
+
     const n = ilPts.length;
 
     // --- 1. Advance trackIdx forward along ideal line ---
@@ -3878,12 +4090,27 @@ function updateAICar(ai, dt, ilPts) {
     }
     const target = ilPts[lookaheadIdx];
 
-    // --- 3. Steer aggressively toward target ---
-    const desiredAngle = Math.atan2(target.y - ai.y, target.x - ai.x);
+    // --- 3. Steer toward target + avoidance offset ---
+    // Collect nearby cars (other AIs + player)
+    const AVOID_RADIUS = 120;
+    let avoidX = 0, avoidY = 0;
+    const others = [...aiCars.filter(o => o !== ai), { x: car.x, y: car.y, vx: car.vx, vy: car.vy }];
+    for (const other of others) {
+        const odx = ai.x - other.x, ody = ai.y - other.y;
+        const odist = Math.sqrt(odx * odx + ody * ody);
+        if (odist < AVOID_RADIUS && odist > 0) {
+            const strength = (1 - odist / AVOID_RADIUS) * 180;
+            avoidX += (odx / odist) * strength;
+            avoidY += (ody / odist) * strength;
+        }
+    }
+    const adjTargetX = target.x + avoidX;
+    const adjTargetY = target.y + avoidY;
+
+    const desiredAngle = Math.atan2(adjTargetY - ai.y, adjTargetX - ai.x);
     let angleDiff = desiredAngle - ai.angle;
     while (angleDiff >  Math.PI) angleDiff -= Math.PI * 2;
     while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-    // In corners: steer hard. On straights: gentle correction.
     const steerStrength = nearTurn > 0.15 ? 9.0 : 5.0;
     ai.angle += angleDiff * steerStrength * dt;
 
@@ -3911,24 +4138,52 @@ function updateAICar(ai, dt, ilPts) {
     }
     // maxTurn in [0..π]: 0 = straight, high = sharp corner
     const cornerFactor = Math.min(1, maxTurn / 0.25);
-    const targetSpeed = CAR_MAX_SPEED - cornerFactor * 530; // same top speed as player, ~360 on hairpin
-    const accel = ai.speed < targetSpeed ? 420 : -900;
-    ai.speed = Math.max(0, Math.min(CAR_MAX_SPEED, ai.speed + accel * dt));
+    const tireSpeedFactor = 0.5 + 0.5 * (ai.tireWear / 100);
+    const targetSpeed = Math.min(AI_MAX_SPEED, (AI_MAX_SPEED - cornerFactor * 460)) * tireSpeedFactor;
+    const accel = ai.speed < targetSpeed ? 380 : -800;
+    ai.speed = Math.max(0, Math.min(AI_MAX_SPEED, ai.speed + accel * dt));
 
-    // --- 5. Move ---
+    // --- 5. Reifenverschleiß ---
+    const speedRatio = ai.speed / AI_MAX_SPEED;
+    ai.tireWear = Math.max(0, ai.tireWear - speedRatio * 0.6 * dt);
+
+    // --- 6. Move ---
     ai.x += Math.cos(ai.angle) * ai.speed * dt;
     ai.y += Math.sin(ai.angle) * ai.speed * dt;
     ai.vx = Math.cos(ai.angle) * ai.speed;
     ai.vy = Math.sin(ai.angle) * ai.speed;
+
+    // --- 7. Runden-Zählung für KI ---
+    if (raceMode === 'laps' && activeTrack && ai.finishTime === null) {
+        const fp = activeTrack.points[0];
+        const fdx = ai.x - fp.x, fdy = ai.y - fp.y;
+        const fdist = Math.sqrt(fdx * fdx + fdy * fdy);
+        const fn = activeTrack.points[1];
+        const ftx = fn.x - fp.x, fty = fn.y - fp.y;
+        const ftLen = Math.sqrt(ftx * ftx + fty * fty);
+        const fdot = (fdx * ftx + fdy * fty) / (ftLen || 1);
+        const onLine = fdist < TRACK_WIDTH * 1.2 && Math.abs(fdot) < 30;
+        if (!onLine) {
+            if (fdist > TRACK_WIDTH * 2) ai.crossedAway = true;
+        } else if (ai.crossedAway && fdot >= 0) {
+            ai.crossedAway = false;
+            if (raceStarted) {
+                ai.lapCount++;
+                if (ai.lapCount >= RACE_TOTAL_LAPS) {
+                    ai.finishTime = performance.now() - raceStartTime;
+                }
+            }
+        }
+    }
 }
 
 function checkAICollisions(dt) {
+    // Player vs AI
     for (const ai of aiCars) {
         const dx = car.x - ai.x, dy = car.y - ai.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
         const minDist = (car.width + ai.width) * 0.6;
         if (dist < minDist && dist > 0) {
-            // Push apart
             const nx = dx / dist, ny = dy / dist;
             const overlap = minDist - dist;
             car.x += nx * overlap * 0.6;
@@ -3936,26 +4191,45 @@ function checkAICollisions(dt) {
             ai.x -= nx * overlap * 0.4;
             ai.y -= ny * overlap * 0.4;
 
-            // Relative velocity along impact normal
             const relVx = car.vx - ai.vx, relVy = car.vy - ai.vy;
             const impact = Math.abs(relVx * nx + relVy * ny);
-
             if (impact > 80) {
-                // Damage proportional to impact
-                const dmg = impact * 0.04;
+                const dmg = impact * 0.032;
                 car.damage = Math.min(100, car.damage + dmg);
                 ai.damage = Math.min(100, ai.damage + dmg * 0.5);
-
-                // Bounce player
                 const dot = car.vx * nx + car.vy * ny;
                 car.vx -= dot * nx * 1.2;
                 car.vy -= dot * ny * 1.2;
-
-                // 5-second penalty if damage > 7%
                 if (dmg > 7 && car.penaltyMsgTimer <= 0) {
                     car.pitPenalty += 5;
                     car.penaltyMsg = 'You have a 5 second time penalty for that';
                     car.penaltyMsgTimer = 5;
+                }
+            }
+        }
+    }
+
+    // AI vs AI
+    for (let i = 0; i < aiCars.length; i++) {
+        for (let j = i + 1; j < aiCars.length; j++) {
+            const a = aiCars[i], b = aiCars[j];
+            const dx = a.x - b.x, dy = a.y - b.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const minDist = (a.width + b.width) * 0.6;
+            if (dist < minDist && dist > 0) {
+                const nx = dx / dist, ny = dy / dist;
+                const overlap = minDist - dist;
+                a.x += nx * overlap * 0.5;
+                a.y += ny * overlap * 0.5;
+                b.x -= nx * overlap * 0.5;
+                b.y -= ny * overlap * 0.5;
+
+                const relVx = a.vx - b.vx, relVy = a.vy - b.vy;
+                const impact = Math.abs(relVx * nx + relVy * ny);
+                if (impact > 80) {
+                    const dmg = impact * 0.03;
+                    a.damage = Math.min(100, a.damage + dmg);
+                    b.damage = Math.min(100, b.damage + dmg);
                 }
             }
         }
